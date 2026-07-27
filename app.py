@@ -5,6 +5,7 @@
 
 import json
 import os
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -18,7 +19,14 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 PREVIEW_W, PREVIEW_H = pt.WIDTH, pt.HEIGHT  # 480 x 320, реальный размер этикетки в точках
-DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tags_list.json")
+
+# В собранном PyInstaller-exe (--onefile) __file__ указывает на временную
+# папку распаковки, а не на папку с .exe — поэтому берём путь к самому exe.
+if getattr(sys, "frozen", False):
+    _BASE_DIR = os.path.dirname(sys.executable)
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(_BASE_DIR, "tags_list.json")
 
 
 class PriceTagApp(ctk.CTk):
@@ -80,11 +88,34 @@ class PriceTagApp(ctk.CTk):
 
         dev_frame = ctk.CTkFrame(form, fg_color="transparent")
         dev_frame.pack(pady=(24, 4), padx=18, fill="x", side="bottom")
-        ctk.CTkLabel(dev_frame, text="Устройство принтера").pack(anchor="w")
-        self.e_device = ctk.CTkEntry(dev_frame)
-        self.e_device.insert(0, pt.DEVICE)
-        self.e_device.pack(fill="x", pady=(4, 0))
-        self._bind_editing_shortcuts(self.e_device)
+
+        if sys.platform == "win32":
+            ctk.CTkLabel(dev_frame, text="Принтер").pack(anchor="w")
+            printers = pt.list_printers()
+            default = pt.DEVICE if pt.DEVICE in printers else (printers[0] if printers else "")
+            self.printer_var = tk.StringVar(value=default)
+            self.printer_menu = ctk.CTkOptionMenu(dev_frame, variable=self.printer_var,
+                                                   values=printers or ["Принтер не найден"])
+            self.printer_menu.pack(fill="x", pady=(4, 0))
+            ctk.CTkButton(dev_frame, text="Обновить список принтеров", fg_color="transparent",
+                          border_width=1, command=self._refresh_printers).pack(fill="x", pady=(6, 0))
+        else:
+            ctk.CTkLabel(dev_frame, text="Устройство принтера").pack(anchor="w")
+            self.e_device = ctk.CTkEntry(dev_frame)
+            self.e_device.insert(0, pt.DEVICE)
+            self.e_device.pack(fill="x", pady=(4, 0))
+            self._bind_editing_shortcuts(self.e_device)
+
+    def _refresh_printers(self):
+        printers = pt.list_printers()
+        self.printer_menu.configure(values=printers or ["Принтер не найден"])
+        if printers and self.printer_var.get() not in printers:
+            self.printer_var.set(printers[0])
+
+    def _get_device(self) -> str:
+        if sys.platform == "win32":
+            return self.printer_var.get()
+        return self.e_device.get().strip() or pt.DEVICE
 
     def _field(self, parent, label, default=""):
         ctk.CTkLabel(parent, text=label, text_color="#a0a0a0",
@@ -172,8 +203,13 @@ class PriceTagApp(ctk.CTk):
                                             command=lambda: self._print(selected_only=False))
         self.btn_print_all.pack(side="right")
 
+        bulk_btns = ctk.CTkFrame(mid, fg_color="transparent")
+        bulk_btns.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 18))
+        ctk.CTkButton(bulk_btns, text="Изменить цены для выбранных...",
+                      command=self._open_bulk_price_dialog).pack(side="left")
+
         self.status_label = ctk.CTkLabel(mid, text="", text_color="#8fbf8f", anchor="w")
-        self.status_label.grid(row=4, column=0, sticky="ew", padx=18, pady=(0, 12))
+        self.status_label.grid(row=5, column=0, sticky="ew", padx=18, pady=(0, 12))
 
     # ---------- превью справа ----------
     def _build_preview(self):
@@ -361,6 +397,97 @@ class PriceTagApp(ctk.CTk):
         self._clear_form()
         self._set_status("Выбранные ценники удалены")
 
+    # ---------- массовое редактирование цены ----------
+    def _apply_bulk_price(self, indices: list[int], field: str, mode: str, value: int) -> tuple[int, int]:
+        """Применяет установку/изменение цены к items[indices]. Возвращает (изменено, пропущено)."""
+        changed = 0
+        skipped = 0
+        for idx in indices:
+            item = self.items[idx]
+            if mode == "set":
+                item[field] = value
+                changed += 1
+            else:
+                current = item.get(field)
+                if current is None:
+                    skipped += 1
+                    continue
+                item[field] = max(0, current + value)
+                changed += 1
+        return changed, skipped
+
+    def _open_bulk_price_dialog(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showwarning("Нет выбора",
+                                   "Выберите позиции в списке для массового изменения цены")
+            return
+        indices = [int(i) for i in sel]
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Изменить цены")
+        dialog.geometry("380x340")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        ctk.CTkLabel(dialog, text=f"Выбрано позиций: {len(indices)}",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(18, 12), padx=20, anchor="w")
+
+        ctk.CTkLabel(dialog, text="Поле", text_color="#a0a0a0").pack(anchor="w", padx=20)
+        field_var = tk.StringVar(value="price")
+        field_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        field_frame.pack(fill="x", padx=20, pady=(2, 12))
+        ctk.CTkRadioButton(field_frame, text="Цена", variable=field_var, value="price").pack(side="left")
+        ctk.CTkRadioButton(field_frame, text="Старая цена", variable=field_var,
+                           value="old_price").pack(side="left", padx=(16, 0))
+
+        ctk.CTkLabel(dialog, text="Действие", text_color="#a0a0a0").pack(anchor="w", padx=20)
+        mode_var = tk.StringVar(value="set")
+        mode_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        mode_frame.pack(fill="x", padx=20, pady=(2, 12))
+        ctk.CTkRadioButton(mode_frame, text="Установить значение",
+                          variable=mode_var, value="set").pack(anchor="w")
+        ctk.CTkRadioButton(mode_frame, text="Изменить на (можно со знаком минус)",
+                          variable=mode_var, value="delta").pack(anchor="w", pady=(6, 0))
+
+        ctk.CTkLabel(dialog, text="Значение", text_color="#a0a0a0").pack(anchor="w", padx=20)
+        value_entry = ctk.CTkEntry(dialog, placeholder_text="например 500 или -500")
+        value_entry.pack(fill="x", padx=20, pady=(2, 0))
+        self._bind_editing_shortcuts(value_entry)
+        value_entry.focus_set()
+
+        def apply_bulk_edit():
+            raw = value_entry.get().strip()
+            try:
+                value = int(raw)
+            except ValueError:
+                messagebox.showerror("Ошибка", "Введите целое число (можно со знаком минус)")
+                return
+
+            field = field_var.get()
+            mode = mode_var.get()
+            if mode == "set" and value < 0:
+                messagebox.showerror("Ошибка", "Значение цены не может быть отрицательным")
+                return
+
+            changed, skipped = self._apply_bulk_price(indices, field, mode, value)
+
+            self._refresh_tree()
+            self._save_items()
+            self._clear_form()
+            msg = f"Цены обновлены: {changed}"
+            if skipped:
+                msg += f", пропущено без старой цены: {skipped}"
+            self._set_status(msg)
+            dialog.destroy()
+
+        btns = ctk.CTkFrame(dialog, fg_color="transparent")
+        btns.pack(fill="x", padx=20, pady=20, side="bottom")
+        ctk.CTkButton(btns, text="Применить", command=apply_bulk_edit).pack(side="right")
+        ctk.CTkButton(btns, text="Отмена", fg_color="transparent", border_width=1,
+                      command=dialog.destroy).pack(side="right", padx=(0, 8))
+        value_entry.bind("<Return>", lambda _ev: apply_bulk_edit())
+
     def _on_select(self, _event=None):
         sel = self.tree.selection()
         if len(sel) != 1:
@@ -385,7 +512,7 @@ class PriceTagApp(ctk.CTk):
                 return
             to_print = list(self.items)
 
-        device = self.e_device.get().strip() or pt.DEVICE
+        device = self._get_device()
         total = len(to_print)
 
         self._print_cancel = threading.Event()

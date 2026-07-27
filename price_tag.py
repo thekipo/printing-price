@@ -4,9 +4,16 @@
 Этикетка: 60 x 40 мм, 203 DPI (8 точек/мм) => 480 x 320 точек.
 Кириллица печатается через рендер картинки (Pillow) + команда BITMAP,
 т.к. встроенные шрифты TSPL кириллицу не тянут.
+
+Печать кроссплатформенная:
+- Linux: device — путь к устройству (например /dev/usb/lp0), пишем в него сырые байты.
+- Windows: device — имя принтера из "Устройства и принтеры", байты уходят через
+  спулер Windows как задание типа RAW (см. list_printers/_send_to_printer).
 """
 
 import glob
+import os
+import sys
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -19,21 +26,73 @@ GAP_MM = 2
 WIDTH = LABEL_W_MM * DPI_PER_MM    # 480
 HEIGHT = LABEL_H_MM * DPI_PER_MM   # 320
 
-DEVICE = "/dev/usb/lp0"
-
 SHOP_NAME = "Step Up"
+
+IS_WINDOWS = sys.platform == "win32"
+
+
+def list_printers() -> list[str]:
+    """Принтеры, установленные в Windows. На Linux всегда пустой список —
+    там печать идёт по пути устройства, а не по имени принтера."""
+    if not IS_WINDOWS:
+        return []
+    import win32print
+    flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+    return [p[2] for p in win32print.EnumPrinters(flags)]
+
+
+def _default_device() -> str:
+    if IS_WINDOWS:
+        try:
+            import win32print
+            return win32print.GetDefaultPrinter()
+        except Exception:
+            return ""
+    return "/dev/usb/lp0"
+
+
+DEVICE = _default_device()
+
+
+def _send_to_printer(payload: bytes, device: str) -> None:
+    if IS_WINDOWS:
+        import win32print
+        h = win32print.OpenPrinter(device)
+        try:
+            win32print.StartDocPrinter(h, 1, ("Ценник", None, "RAW"))
+            try:
+                win32print.StartPagePrinter(h)
+                win32print.WritePrinter(h, payload)
+                win32print.EndPagePrinter(h)
+            finally:
+                win32print.EndDocPrinter(h)
+        finally:
+            win32print.ClosePrinter(h)
+    else:
+        with open(device, "wb") as f:
+            f.write(payload)
+
 
 # ---------- Шрифты ----------
 # Ищем в системе шрифт с кириллицей. Порядок = приоритет.
 
+if IS_WINDOWS:
+    _FONT_DIRS = [os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")]
+else:
+    _FONT_DIRS = ["/usr/share/fonts", os.path.expanduser("~/.fonts")]
+
+
 def _find_font(*names: str) -> str:
-    for name in names:
-        hits = glob.glob(f"/usr/share/fonts/**/{name}", recursive=True)
-        if hits:
-            return hits[0]
+    for base in _FONT_DIRS:
+        for name in names:
+            hits = glob.glob(os.path.join(base, "**", name), recursive=True)
+            if hits:
+                return hits[0]
     raise FileNotFoundError(
         f"Не найден ни один из шрифтов: {names}\n"
-        f"Установи: sudo dnf install liberation-sans-fonts dejavu-sans-fonts"
+        + ("Установи Arial или другой шрифт с кириллицей в Windows."
+           if IS_WINDOWS else
+           "Установи: sudo dnf install liberation-sans-fonts dejavu-sans-fonts")
     )
 
 
@@ -41,11 +100,13 @@ F_BOLD = _find_font(
     "LiberationSans-Bold.ttf",
     "DejaVuSans-Bold.ttf",
     "FreeSansBold.ttf",
+    "arialbd.ttf",
 )
 F_REG = _find_font(
     "LiberationSans-Regular.ttf",
     "DejaVuSans.ttf",
     "FreeSans.ttf",
+    "arial.ttf",
 )
 
 
@@ -238,8 +299,7 @@ def print_tag(model: str, price: int, old_price: int | None = None,
     """Печатает ценник на принтере."""
     img = render_tag(model, price, old_price, size, shelf)
     payload = build_tspl(img, copies)
-    with open(device, "wb") as f:
-        f.write(payload)
+    _send_to_printer(payload, device)
 
 
 def print_batch(items: list[dict], device: str = DEVICE) -> None:

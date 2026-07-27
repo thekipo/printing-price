@@ -3,3 +3,9 @@ __pycache__/
 
 # рабочий список ценников — данные магазина, не код
 tags_list.json
+
+# артефакты сборки .exe (Windows, build_exe.bat)
+venv/
+build/
+dist/
+*.spec
